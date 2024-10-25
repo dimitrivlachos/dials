@@ -432,69 +432,131 @@ namespace dials { namespace algorithms {
 
     /**
      * Compute the threshold
+     * @param table - The summed area table
      * @param src - The input array
      * @param mask - The mask array
-     * @param dst The output array
+     * @param dst - A 2D array that will be filled with the thresholding results (true
+     * for above threshold, false for below)
      */
     template <typename T>
     void compute_threshold(af::ref<Data<T> > table,
                            const af::const_ref<T, af::c_grid<2> > &src,
                            const af::const_ref<bool, af::c_grid<2> > &mask,
                            af::ref<bool, af::c_grid<2> > dst) {
-      // Get the size of the image
+      // Get the size of the image (ysize is the number of rows, xsize is the number of
+      // columns).
       std::size_t ysize = src.accessor()[0];
       std::size_t xsize = src.accessor()[1];
 
-      // The kernel size
+      /*
+       * The kernel size, defined in terms of half-widths in the x and y
+       * directions. `kxsize` is half the kernel size in x direction,
+       * `kysize` is half the kernel size in y direction.
+       */
       int kxsize = kernel_size_[1];
       int kysize = kernel_size_[0];
 
-      // Calculate the local mean at every point
+      // Calculate the local mean and variance at every point in the image.
+      // Loop through each row `j`.
       for (std::size_t j = 0, k = 0; j < ysize; ++j) {
+        // Loop through each column `i` in row `j`.
+        // `k` is the linear index for the current pixel in the 2D image.
         for (std::size_t i = 0; i < xsize; ++i, ++k) {
-          int i0 = i - kxsize - 1, i1 = i + kxsize;
-          int j0 = j - kysize - 1, j1 = j + kysize;
-          i1 = i1 < xsize ? i1 : xsize - 1;
-          j1 = j1 < ysize ? j1 : ysize - 1;
+          // Define the bounds of the kernel around the current pixel (i, j).
+          int i0 = i - kxsize - 1;  // Lower x-bound of the kernel.
+          int i1 = i + kxsize;      // Upper x-bound of the kernel.
+          int j0 = j - kysize - 1;  // Lower y-bound of the kernel.
+          int j1 = j + kysize;      // Upper y-bound of the kernel.
+
+          // Ensure that the upper bounds are within the image limits.
+          i1 = i1 < xsize ? i1 : xsize - 1;  // Clamp `i1` to be less than `xsize`.
+          j1 = j1 < ysize ? j1 : ysize - 1;  // Clamp `j1` to be less than `ysize`.
+
+          // Compute the linear indices for the top-left (`k0`) and
+          // bottom-right (`k1`) of the kernel region.
+
+          // Index of the top-left corner of the kernel in the 1D array.
           int k0 = j0 * xsize;
+          // Index of the bottom-right corner of the kernel in the 1D array.
           int k1 = j1 * xsize;
 
-          // Compute the number of points valid in the local area,
-          // the sum of the pixel values and the sum of the squared pixel
-          // values.
-          double m = 0;
-          double x = 0;
-          double y = 0;
+          // Variables for accumulation
+          double m = 0;  // number of valid points in the kernel region
+          double x = 0;  // sum of pixel intensities in the kernel region
+          double y = 0;  // sum of squares of pixel intensities in the kernel region
+
+          // Calculate the sum and count of valid points in the kernel region.
+          // If the kernel's top-left corner is within the image bounds:
           if (i0 >= 0 && j0 >= 0) {
+            // Data at the top-left corner of the kernel.
             const Data<T> &d00 = table[k0 + i0];
+            // Data at the bottom-left corner of the kernel.
             const Data<T> &d10 = table[k1 + i0];
+            // Data at the top-right corner of the kernel.
             const Data<T> &d01 = table[k0 + i1];
+
+            /*
+             * Calculate `m`, `x`, and `y` based on the difference between the data
+             * points. This effectively computes the sum and count for the current
+             * kernel region.
+             */
             m += d00.m - (d10.m + d01.m);
             x += d00.x - (d10.x + d01.x);
             y += d00.y - (d10.y + d01.y);
-          } else if (i0 >= 0) {
+          } else if (i0 >= 0) {  // If the top-left corner is outside the image
+                                 // vertically but within bounds horizontally:
+            // Data at the bottom-left corner of the kernel.
             const Data<T> &d10 = table[k1 + i0];
+            // Subtract the count of valid pixels below the region.
             m -= d10.m;
+            // Subtract the sum of pixel intensities below the region.
             x -= d10.x;
+            // Subtract the sum of squares of pixel intensities below the region.
             y -= d10.y;
-          } else if (j0 >= 0) {
+          } else if (j0 >= 0) {  // If the top-left corner is outside the image
+                                 // horizontally but within bounds vertically:
+            // Data at the top-right corner of the kernel.
             const Data<T> &d01 = table[k0 + i1];
+            // Subtract the count of valid pixels to the right of the region.
             m -= d01.m;
+            // Subtract the sum of pixel intensities to the right of the region.
             x -= d01.x;
+            // Subtract the sum of squares of pixel intensities to the right of the
+            // region.
             y -= d01.y;
           }
+
+          // Always add the values at the bottom-right corner of the kernel.
           const Data<T> &d11 = table[k1 + i1];
+          // Add the count of valid pixels in the entire region.
           m += d11.m;
+          // Add the sum of pixel intensities in the entire region.
           x += d11.x;
+          // Add the sum of squares of pixel intensities in the entire region.
           y += d11.y;
 
-          // Compute the thresholds
-          dst[k] = false;
+          // Compute the thresholds for the current pixel.
+          dst[k] = false;  // Initialize the output mask as `false`.
+
+          /*
+           * If the pixel is valid (as indicated by `mask[k]`), the number of valid
+           * points is greater than or equal to `min_count`, the sum of intensities `x`
+           * is non-negative, and the pixel intensity is greater than the global
+           * threshold:
+           */
           if (mask[k] && m >= min_count_ && x >= 0 && src[k] > threshold_) {
+            // Calculate parameters for the dispersion test.
+            // `a` is the variance
             double a = m * y - x * x - x * (m - 1);
+            // `b` is the signal-to-background ratio.
             double b = m * src[k] - x;
+            // `c` is the background noise threshold.
             double c = x * nsig_b_ * std::sqrt(2 * (m - 1));
+            // `d` is the signal significance threshold.
             double d = nsig_s_ * std::sqrt(x * m);
+
+            // Set the output mask as `true` if the variance metric `a` is greater than
+            // `c` and the signal-to-background ratio `b` is greater than `d`.
             dst[k] = a > c && b > d;
           }
         }
